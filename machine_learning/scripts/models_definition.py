@@ -31,3 +31,5 @@ def create_models(n_features, y_dim):
         LGBMRegressor.__name__: LGBMRegressor(),
         'LSTM': get_LSTM(n_features, y_dim)
     })
+
+    return all_regs

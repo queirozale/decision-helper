@@ -1,119 +1,114 @@
-from datetime import datetime
 import pandas as pd
-from pandas.core.arrays import boolean
 import numpy as np
-import math
+import logging
+from tqdm import tqdm
+from math import ceil
+from functools import reduce
 
 
 class FeatureExtractor:
-    """Feature Extractor
-    Extracts the autogressive and categorical features of the
-    Time Series.
-
-    Args:
-        df (pd.DataFrame): Time Series dataframe, with the 'y' column
-        representing the observations.
-        start_date (datetime.datetime): Represents the beginning of the
-        feature extratction. It is important to be careful with the
-        start_date and the number of previous days/weeks used during the 
-        extraction.
-
-    Attributes:
-        features (dict): autoregressive and categorical features.
-    """
-    def __init__(self, df, start_date):
+    def __init__(self, df):
         self.df = df
-        self.start_date = start_date
-        self.date_list = None
-        self.features = {'date': self.date_list}
-
-    def preprocess(self):
         self.df['date'] = pd.to_datetime(self.df['date'])
-        self.date_list = self.df[self.df['date'] >= self.start_date]['date'].tolist()
-        self.df['weekday'] = self.df['date'].dt.dayofweek
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger('FeatureExtractor')
+        self.logger.setLevel(logging.INFO)
 
-    @staticmethod
-    def get_previous_y(df, n, by_weekday, **kwargs):
-        """
-        Get the n previous observations, daily or weekly.
+    def get_price_features(self):
+        self.logger.info('Extracting price features')
+        selected_cols = ['date','item_nbr', 'store_nbr', 'price']
+        grid_df = self.df[selected_cols]
 
-        Args:
-            df (pd.DataFrame): Time Series dataframe, with 
-            the 'y' column representing the observations.
-            n (int): number of previous observations.
-            by_weekday (bool): If it is True, collects the observations 
-            from the exactly same day of week, but from previous weeks. 
-            If it is False, collects the n previous day observations.
-            date (datetime.datetime) [optional]: Necessary for the
-            by_weekday mode, represents the current date of extraction.
-        """
-        if by_weekday:
-            date = kwargs.get('date')
-            wd = date.weekday()
-            df_weekday = df[df['weekday'] == wd]
-            return df_weekday.iloc[-n:].sort_values(
-                by='date', ascending=False)['y'].T.values
-        else:
-            return df.iloc[-n:].sort_values(
-                by='date', ascending=False)['y'].T.values   
+        grid_df['price_max'] = grid_df.groupby(['store_nbr','item_nbr'])['price'].transform('max')
+        grid_df['price_min'] = grid_df.groupby(['store_nbr','item_nbr'])['price'].transform('min')
+        grid_df['price_std'] = grid_df.groupby(['store_nbr','item_nbr'])['price'].transform('std')
+        grid_df['price_mean'] = grid_df.groupby(['store_nbr','item_nbr'])['price'].transform('mean')
 
-    @staticmethod
-    def get_wom(date: datetime):
-        """
-        Returns the week of the month of the inputed date.
-        """
-        wom = math.ceil(date.day/7)
-        if wom > 4:
-            return 4
-        else:
-            return wom
- 
-    def get_autoregressive_features(self, n_days, n_weeks):
-        """
-        Autoregressive features extraction.
 
-        Args:
-            n_days (int): number of previous days to be collected.
-            n_weeks (int): number of previous weeks to be collected.
-        """
-        cols1 = [f'yt-{k}' for k in range(1, n_days+1)]
-        cols2 = [f'yt-{k*7}' for k in range(1, n_weeks+1)]
-        cols = cols1 + cols2
-        autoregressive_data = {}
-        for date in self.date_list:
-            df_truncate = self.df[self.df['date'] < date].sort_values(by='date')
-            values_daily = self.get_previous_y(df_truncate, n_days, False)
-            values_weekly = self.get_previous_y(df_truncate, n_weeks, True, date=date)
-            values = np.concatenate((values_daily, values_weekly))
-            autoregressive_data[date] = values
-            
-        autoregressive_features = pd.DataFrame(autoregressive_data.values(), columns=cols)
-        self.features['autoregressive'] = autoregressive_features
+        grid_df['price_norm'] = grid_df['price']/grid_df['price_max']
 
+        grid_df['price_nunique'] = grid_df.groupby(['store_nbr','item_nbr'])['price'].transform('nunique') 
+        grid_df['item_nunique'] = grid_df.groupby(['store_nbr','price'])['item_nbr'].transform('nunique')
+
+        grid_df['month'] = grid_df['date'].dt.month.astype(np.int8)
+        grid_df['year'] = grid_df['date'].dt.year
+
+        grid_df['price_momentum'] = grid_df['price']/grid_df.groupby(['store_nbr','item_nbr'])['price'].transform(lambda x: x.shift(1))
+        grid_df['price_momentum_m'] = grid_df['price']/grid_df.groupby(['store_nbr','item_nbr','month'])['price'].transform('mean')
+        grid_df['price_momentum_y'] = grid_df['price']/grid_df.groupby(['store_nbr','item_nbr','year'])['price'].transform('mean')
         
-    def get_categorical_features(self):
-        """
-        Categorical features extraction.
-        Features returned: day of week, week of month, month of year.
-        """
-        df_date = pd.DataFrame({'date': self.date_list})
-        df_date = df_date.merge(self.df, on='date')[['date', 'weekday']]
-        df_date['wom'] = df_date['date'].apply(lambda x: self.get_wom(x))
-        df_date['month'] = pd.DatetimeIndex(df_date['date']).month
-        df_date = df_date[df_date.columns[1:]]
+        grid_df.drop(columns=['month', 'year'], inplace=True)
         
-        features = df_date.columns
-        categorical_features = pd.DataFrame()
-        for feature in features:
-            df_dummy = pd.get_dummies(df_date[feature])
-            df_dummy = df_dummy.rename(columns={
-                col: feature + '_' + str(col) for col in df_dummy.columns
+        return grid_df
+
+    def get_date_features(self):
+        self.logger.info('Extracting date features')
+        selected_cols = ['date', 'item_nbr', 'store_nbr']
+        grid_df = self.df[selected_cols]
+
+        grid_df['day'] = grid_df['date'].dt.day.astype(np.int8)
+        grid_df['week'] = grid_df['date'].dt.week.astype(np.int8)
+        grid_df['month'] = grid_df['date'].dt.month.astype(np.int8)
+        grid_df['year'] = grid_df['date'].dt.year
+        grid_df['year'] = (grid_df['year'] - grid_df['year'].min()).astype(np.int8)
+        grid_df['wom'] = grid_df['day'].apply(lambda x: ceil(x/7)).astype(np.int8)
+        grid_df['dow'] = grid_df['date'].dt.dayofweek.astype(np.int8) 
+        grid_df['weekend'] = (grid_df['dow']>=5).astype(np.int8)
+        
+        return grid_df
+
+    def get_lagged_features(self):
+        self.logger.info('Extracting lagged features')
+        TARGET = 'unit_sales'
+        SHIFT_DAY = 28
+        selected_cols = [
+            'date', 'item_nbr', 'store_nbr', TARGET
+        ]
+        grid_df = self.df[selected_cols]
+
+        LAG_DAYS = [col for col in range(SHIFT_DAY,SHIFT_DAY+15)]
+        grid_df = grid_df.assign(**{
+                '{}_lag_{}'.format(col, l): grid_df.groupby(
+                    ['item_nbr', 'store_nbr']
+                )[col].transform(lambda x: x.shift(l))
+                for l in LAG_DAYS
+                for col in [TARGET]
             })
-            categorical_features = pd.concat([categorical_features, df_dummy], axis=1)
 
-        self.features['categorical'] = categorical_features
+        for col in list(grid_df):
+            if 'lag' in col:
+                grid_df[col] = grid_df[col].astype(np.float16)
+
+        for i in [7,14,30,60,180]:
+            grid_df['rolling_mean_'+str(i)] = grid_df.groupby(
+                ['item_nbr', 'store_nbr']
+            )[TARGET].transform(lambda x: x.shift(SHIFT_DAY).rolling(i).mean()).astype(np.float16)
+            
+            grid_df['rolling_std_'+str(i)]  = grid_df.groupby(
+                ['item_nbr', 'store_nbr']
+            )[TARGET].transform(lambda x: x.shift(SHIFT_DAY).rolling(i).std()).astype(np.float16)
+
+        for d_shift in [1,7,14]:
+            for d_window in [7,14,30,60]:
+                col_name = 'rolling_mean_shift_'+str(d_shift)+'_'+str(d_window)
+                grid_df[col_name] = grid_df.groupby(
+                    ['item_nbr', 'store_nbr']
+                )[TARGET].transform(lambda x: x.shift(d_shift).rolling(d_window).mean()).astype(np.float16)
         
-    def extract(self, n_days: int, n_weeks: int):
-        self.preprocess()
-        self.get_autoregressive_features(n_days, n_weeks)
-        self.get_categorical_features()
+        return grid_df
+
+    def extract(self):
+        categorical_features = self.get_date_features()
+        price_features = self.get_price_features()
+        lagged_features = self.get_lagged_features()
+        
+        num_features = price_features.merge(
+            lagged_features, on=['date', 'item_nbr', 'store_nbr']
+        )
+
+        self.logger.info('Features extracted successfully')
+
+        return {
+            'categorical': categorical_features,
+            'numeric': num_features
+        }
